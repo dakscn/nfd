@@ -9,9 +9,7 @@ const notificationUrl = 'https://raw.githubusercontent.com/LloydAsp/nfd/main/dat
 const startMsgUrl = 'https://raw.githubusercontent.com/LloydAsp/nfd/main/data/startMessage.md';
 
 const enable_notification = true
-/**
- * Return url to telegram api, optionally with parameters added
- */
+
 function apiUrl (methodName, params = null) {
   let query = ''
   if (params) {
@@ -45,6 +43,22 @@ function copyMessage(msg = {}){
 
 function forwardMessage(msg){
   return requestTelegram('forwardMessage', makeReqBody(msg))
+}
+
+/**
+ * 自动记录所有用过的用户ID
+ */
+async function recordUser(chatId) {
+  let raw = await nfd.get('user-list');
+  let users = [];
+  if (raw) {
+    try { users = JSON.parse(raw); } catch(e) { users = []; }
+  }
+  chatId = chatId.toString();
+  if (!users.includes(chatId)) {
+    users.push(chatId);
+    await nfd.put('user-list', JSON.stringify(users)); // 必须是字符串
+  }
 }
 
 /**
@@ -104,10 +118,19 @@ async function onMessage (message) {
     })
   }
   if(message.chat.id.toString() === ADMIN_UID){
+    // 支持管理员群发
+    if(message.text && message.text.startsWith('/broadcast ')){
+      let text = message.text.replace('/broadcast ', '').trim();
+      let stat = await broadcastToAllUsers(text);
+      return sendMessage({
+        chat_id: ADMIN_UID,
+        text: '群发已执行\n' + stat
+      });
+    }
     if(!message?.reply_to_message?.chat){
       return sendMessage({
         chat_id:ADMIN_UID,
-        text:'使用方法，回复转发的消息，并发送回复消息，或者`/block`、`/unblock`、`/checkblock`等指令'
+        text:'使用方法，回复转发的消息，并发送回复消息，或者/block、/unblock、/checkblock等指令'
       })
     }
     if(/^\/block$/.exec(message.text)){
@@ -132,6 +155,10 @@ async function onMessage (message) {
 
 async function handleGuestMessage(message){
   let chatId = message.chat.id;
+
+  // --------自动记录用户ID----------
+  await recordUser(chatId);
+
   let isblocked = await nfd.get('isblocked-' + chatId, { type: "json" })
   
   if(isblocked){
@@ -146,7 +173,8 @@ async function handleGuestMessage(message){
     from_chat_id:message.chat.id,
     message_id:message.message_id
   })
-  console.log(JSON.stringify(forwardReq))
+  // 可注释掉debug日志
+  // console.log(JSON.stringify(forwardReq))
   if(forwardReq.ok){
     await nfd.put('msg-map-' + forwardReq.result.message_id, chatId)
   }
@@ -154,8 +182,6 @@ async function handleGuestMessage(message){
 }
 
 async function handleNotify(message){
-  // 先判断是否是诈骗人员，如果是，则直接提醒
-  // 如果不是，则根据时间间隔提醒：用户id，交易注意点等
   let chatId = message.chat.id;
   if(await isFraud(chatId)){
     return sendMessage({
@@ -231,7 +257,6 @@ async function sendPlainText (chatId, text) {
  * https://core.telegram.org/bots/api#setwebhook
  */
 async function registerWebhook (event, requestUrl, suffix, secret) {
-  // https://core.telegram.org/bots/api#setwebhook
   const webhookUrl = `${requestUrl.protocol}//${requestUrl.hostname}${suffix}`
   const r = await (await fetch(apiUrl('setWebhook', { url: webhookUrl, secret_token: secret }))).json()
   return new Response('ok' in r && r.ok ? 'Ok' : JSON.stringify(r, null, 2))
@@ -250,8 +275,26 @@ async function isFraud(id){
   id = id.toString()
   let db = await fetch(fraudDb).then(r => r.text())
   let arr = db.split('\n').filter(v => v)
-  console.log(JSON.stringify(arr))
   let flag = arr.filter(v => v === id).length !== 0
-  console.log(flag)
   return flag
+}
+
+// --------群发主函数---------
+async function broadcastToAllUsers(text) {
+  let users = await nfd.get('user-list', { type: "json" }) || [];
+  let total = 0, success = 0, fail = 0, blocked = 0;
+  for (let chatId of users) {
+    let isblocked = await nfd.get('isblocked-' + chatId, { type: "json" });
+    if (isblocked) { blocked++; continue; }
+    total++;
+    try {
+      let r = await sendMessage({ chat_id: chatId, text: text });
+      if(r && r.ok) success++;
+      else fail++;
+      await new Promise(res => setTimeout(res, 600));
+    } catch (e) {
+      fail++;
+    }
+  }
+  return `用户总数：${users.length}，实际发送：${total}，成功：${success}，失败：${fail}，被屏蔽：${blocked}`;
 }
